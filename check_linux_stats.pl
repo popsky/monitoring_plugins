@@ -8,6 +8,7 @@
 # Rev. Date : 07/01/2013
 # Rev. Date : 19/11/2015
 # Rev. Date : 12/07/2018 by Siva Paramasivam <apsivam@apsivam.in>
+# Rev. Date : 12/06/2025 by sukong <sukong@outlook.com>
 # ---------------------------------------------------- #
 # ChangeLog for 1.6 (Siva Paramasivam)
 # *) percentage based check for disk usage will return percentage perfdata
@@ -40,15 +41,16 @@ use Getopt::Long;
 use Sys::Statistics::Linux;
 use Sys::Statistics::Linux::Processes;
 use Sys::Statistics::Linux::SysInfo;
+use Sys::Statistics::Linux::CpuStats;
 
 
-use vars qw($script_name $script_version $o_sleep $o_pattern $x_pattern $o_cpu $o_context $o_procs $o_process $o_mem $o_net $o_disk $o_io $o_load $o_file $o_socket $o_paging $o_uptime $o_help $o_version $o_warning $o_critical $o_unit);
+use vars qw($script_name $script_version $o_sleep $o_pattern $x_pattern $o_cpu $o_cpu_steal $o_context $o_procs $o_process $o_procs_cpu $o_mem $o_net $o_disk $o_io $o_load $o_file $o_socket $o_paging $o_uptime $o_help $o_version $o_warning $o_critical $o_unit);
 use strict;
 
 # --------------------------- globals -------------------------- #
 
 $script_name = "check_linux_stats";
-$script_version = "1.6";
+$script_version = "1.7";
 $o_help = undef;
 $o_pattern = undef;
 $x_pattern = undef;
@@ -64,6 +66,9 @@ check_options();
 
 if($o_cpu){
 	check_cpu();
+}
+elsif($o_cpu_steal){
+	check_cpu_steal();
 }
 elsif($o_context){
 	check_context_switch();
@@ -94,6 +99,9 @@ elsif($o_socket){
 }
 elsif($o_process){
 	check_process();
+}
+elsif($o_procs_cpu){
+	check_process_cpu();
 }
 elsif($o_paging){
 	check_paging();
@@ -136,6 +144,38 @@ sub check_cpu {
 		$perfdata .= " steal=$cpu->{steal}%" if(defined($cpu->{steal}));
 
 		print "CPU $status : used $cpu_used% $perfdata";
+	}
+	else {
+		print "No data";
+	}
+}
+
+sub check_cpu_steal {
+	my $lxs = Sys::Statistics::Linux->new(cpustats  => 1);
+	$lxs->init;
+	sleep $o_sleep;
+	my $stat = $lxs->get;
+
+	if(defined($stat->cpustats)) {
+		$status = "OK";
+		my $cpu  = $stat->cpustats->{cpu};
+		my $cpu_steal=sprintf("%.2f", ($cpu->{steal}));
+
+		if ($cpu_steal >= $o_critical) {
+        		$status = "CRITICAL";
+		}
+		elsif ($cpu_steal >= $o_warning) {
+        		$status = "WARNING";
+		}
+		
+		my $perfdata .= "|"
+		."idle=$cpu->{idle}% "
+		."user=$cpu->{user}% "
+		."system=$cpu->{system}% "
+		."iowait=$cpu->{iowait}% "
+		."steal=$cpu->{steal}%";
+
+		print "CPU $status : CPU steal $cpu_steal% $perfdata";
 	}
 	else {
 		print "No data";
@@ -259,6 +299,82 @@ sub check_process {
 
 		}
 		print "PROCESSES $status : ".join(',',@pname)." $perfdata";
+	}
+}
+
+sub check_process_cpu {
+	my $perfdata = "";
+	my $infodata = "";
+	my @pids = ();
+	my @ps_output = `ps -eo pid,comm | grep '$o_pattern' | grep -v grep`;
+	foreach my $line (@ps_output) {
+		if ($line =~ /^\s*(\d+)\s+/) {
+			push @pids, $1;
+		}
+	}
+
+	if($#pids > -1) {
+		my $lxs = Sys::Statistics::Linux->new(
+			processes => {
+        		init => 1,
+        		pids => \@pids
+			},
+		);
+		my $icpu_stat = Sys::Statistics::Linux::CpuStats->new->raw;
+		sleep $o_sleep;
+		my $dcpu_stat = Sys::Statistics::Linux::CpuStats->new->raw;
+		my $stat = $lxs->get;
+		
+		my $cpu_uptime = {};
+		foreach my $cpu (keys %{$dcpu_stat}) {
+			my $icpu = $icpu_stat->{$cpu};
+			my $dcpu = $dcpu_stat->{$cpu};
+			my $uptime;
+
+			while (my ($k, $v) = each %{$dcpu}) {
+				if (!defined $icpu->{$k}) {
+					die "not defined key found '$k'";
+				}
+
+				if ($v !~ /^\d+\z/ || $dcpu->{$k} !~ /^\d+\z/) {
+					die "invalid value for key '$k'";
+				}
+
+				$uptime += ($dcpu->{$k} - $icpu->{$k});
+			}
+
+			$cpu_uptime->{$cpu}	 = $uptime;
+    	}
+
+		if(defined($stat->processes)) {
+			my $processes = $stat->processes;
+			$status = "OK";
+			my $crit = 0; #critical counter
+			my $warn = 0; #warning counter
+			foreach my $process (keys (%$processes)) {
+				my $cmd = $processes->{$process}->{cmdline};
+				my $cpu_key = "cpu".$processes->{$process}->{cpu};
+				if(!defined($cpu_uptime->{$cpu_key})) {
+					die "No CPU data for process $cmd";
+				}
+				my $cpu = $processes->{$process}->{ttime} / $cpu_uptime->{$cpu_key} * 100;
+				if($cpu >= $o_critical) {$crit++; $infodata .= " "
+					.$cmd.".cpu=".sprintf("%.2f", $cpu)."%";}
+				elsif($cpu >= $o_warning){ $warn++; $infodata .= " "
+					.$cmd.".cpu=".sprintf("%.2f", $cpu)."%";}
+
+				$perfdata .= "|"
+					.$cmd.".cpu=".sprintf("%.2f", $cpu)."%";
+			}
+
+			if($crit>0) {$status="CRITICAL";}
+			elsif($warn>0) {$status="WARNING";}
+
+		}
+		print "PROCESSES CPU $status (WARN: $o_warning%, CRIT: $o_critical%): $infodata $perfdata";
+	}
+	else {
+		print "PROCESSES CPU OK, no matching processes found for pattern '$o_pattern'";
 	}
 }
 
@@ -660,7 +776,10 @@ sub help {
 	-h, --help
    		print this help message
 	-C, --cpu=CPU USAGE
-	-P, --procs
+	--cpu-steal=CPU STEAL
+	-P, --procs=PROCESS COUNT
+	-T, --top=PROCESS VIRTUAL MEMORY
+	--procs-cpu=PROCESS CPU USAGE, use -p to specify processes name to match.
 	-M, --memory=MEMORY USAGE
 	-N, --network=NETWORK USAGE
 	-D, --disk=DISK USAGE
@@ -673,8 +792,8 @@ sub help {
 	-U, --uptime
 	-p, --pattern
 		eth0,eth1...sda1,sda2.../usr,/tmp
-        -x, --exclude
-                tmpfs,devtmpfs
+	-x, --exclude
+		tmpfs,devtmpfs
 	-w, --warning
 	-c, --critical
 	-s, --sleep
@@ -705,9 +824,11 @@ sub check_options {
 		'h'	=> \$o_help,		'help'		=> \$o_help,
 		's:i'	=> \$o_sleep,		'sleep:i'	=> \$o_sleep,
 		'C'	=> \$o_cpu,		'cpu'		=> \$o_cpu,
+		'cpu-steal'	=> \$o_cpu_steal,
 		'X'	=> \$o_context,		'ctx'		=> \$o_context,
 		'P'	=> \$o_procs, 		'procs'		=> \$o_procs,
 		'T'	=> \$o_process, 	'top'		=> \$o_process,
+		'procs-cpu'	=> \$o_procs_cpu,
 		'M'	=> \$o_mem,		'memory'	=> \$o_mem,
 		'N'	=> \$o_net,		'network'	=> \$o_net,
 		'D'	=> \$o_disk,		'disk'		=> \$o_disk,
